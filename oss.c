@@ -1,5 +1,3 @@
-
-
 #include <errno.h>
 #include <stdlib.h>
 #include <signal.h>
@@ -24,8 +22,15 @@ static void print_help_message(char* executable_name,
                                int max_sim_time);
 static int is_required_argument(char optopt);
 static void print_required_argument_message(char optopt);
-static int segment_id;
-static char* shared_memory;
+static int get_clock_shared_segment_size(void);
+static void attach_to_shared_memory(void);
+static void fork_children(int num_children);
+static void get_shared_memory(void);
+
+static int clock_segment_id;
+static int* clock_shared_memory;
+static int message_segment_id;
+static int* message_shared_memory;
 
 int main(int argc, char* argv[]) {
   int help_flag = 0;
@@ -99,9 +104,19 @@ int main(int argc, char* argv[]) {
 
   signal(SIGINT, free_shared_memory_and_abort);
 
+  get_shared_memory();
+
+  attach_to_shared_memory();
+
+  fork_children(max_slaves);
+
   free_shared_memory();
 
   return EXIT_SUCCESS;
+}
+
+static int get_clock_shared_segment_size() {
+  return 2 * sizeof(int);
 }
 
 /**
@@ -109,8 +124,10 @@ int main(int argc, char* argv[]) {
  */
 static void free_shared_memory(void) {
   printf("Freeing shared memory\n");
-  shmdt(shared_memory);
-  shmctl(segment_id, IPC_RMID, 0);
+  shmdt(clock_shared_memory);
+  shmdt(message_shared_memory);
+  shmctl(clock_segment_id, IPC_RMID, 0);
+  shmctl(message_segment_id, IPC_RMID, 0);
 }
 
 
@@ -148,6 +165,16 @@ static int setup_interval_timer(int time) {
   return (setitimer(ITIMER_PROF, &value, NULL));
 }
 
+/**
+ * Prints a help message.
+ * The parameters correspond to program arguments.
+ *
+ * @param executable_name Name of the executable
+ * @param max_slaves Number of maximum slaves
+ * @param log_file Name of the log file
+ * @param max_run_time Maximum time program runs
+ * @param max_sim_time Maximum simulated time program runs
+ */
 static void print_help_message(char* executable_name,
                                int max_slaves,
                                char* log_file,
@@ -163,6 +190,12 @@ static void print_help_message(char* executable_name,
   printf(" -m  Simulated time in seconds master will terminate itself and all children. Defaults to %d.\n", max_sim_time);
 }
 
+/**
+ * Determiens whether optopt is a reguired argument.
+ *
+ * @param optopt Value returned by getopt when there's a missing option argument.
+ * @return 1 when optopt is a required argument and 0 otherwise.
+ */
 static int is_required_argument(char optopt) {
   switch (optopt) {
     case 's':
@@ -175,8 +208,13 @@ static int is_required_argument(char optopt) {
   }
 }
 
-static void print_required_argument_message(char optopt) {
-  switch (optopt) {
+/**
+ * Prints a message for a missing option argument.
+ * 
+ * @param option The option that was missing a required argument.
+ */
+static void print_required_argument_message(char option) {
+  switch (option) {
     case 's':
       fprintf(stderr, "Option -%c requires the number of slave processes.\n", optopt);
       break;
@@ -189,5 +227,71 @@ static void print_required_argument_message(char optopt) {
     case 'm':
       fprintf(stderr, "Option -%c requires the maximum simulated time before master will terminate itself and all its children.\n", optopt);
       break;
+  }
+}
+
+/**
+ * Allocates shared memory for a simulated clock and message.
+ * Populates clock_segment_id and message_segment_id with
+ * shared memory segment IDs.
+ */
+static void get_shared_memory(void) {
+  int shared_segment_size = get_clock_shared_segment_size();
+  clock_segment_id = shmget(IPC_PRIVATE, shared_segment_size,
+    IPC_CREAT | IPC_EXCL | S_IRUSR | S_IWUSR);
+  message_segment_id = shmget(IPC_PRIVATE, shared_segment_size,
+    IPC_CREAT | IPC_EXCL | S_IRUSR | S_IWUSR);
+
+  if (clock_segment_id == -1 || message_segment_id == -1) {
+    perror("oss shmget");
+    exit(EXIT_FAILURE);
+  }
+}
+
+/**
+ * Attaches to the clock and message shared memory segments.
+ * Populates clock_shared_memory and message_shared_memory
+ * with references to their appropriate memory location.
+ */
+static void attach_to_shared_memory(void) {
+  clock_shared_memory = (int*) shmat(clock_segment_id, 0, 0);
+  message_shared_memory = (int*) shmat(message_segment_id, 0, 0);
+
+  if (*clock_shared_memory == -1 || *message_shared_memory == -1) {
+    perror("master shmat");
+    exit(EXIT_FAILURE);
+  }
+}
+
+/**
+ * Forks and executes children processes.
+ *
+ * @param num_children The number of children to fork.
+ */
+static void fork_children(int num_children) {
+  int i;
+  pid_t children_pids[num_children];
+  int statuses[num_children];
+  for (i = 0; i < num_children; i++) {
+    children_pids[i] = fork();
+
+    if (children_pids[i] == -1) {
+      perror("oss fork");
+      exit(EXIT_FAILURE);
+    }
+
+    if (children_pids[i] == 0) { // Child
+      execlp(
+        "user",
+        "user",
+        (char*) NULL
+      );
+      perror("palin");
+      _exit(EXIT_FAILURE);
+    }
+  }
+  int k;
+  for (k = 0; k < num_children; k++) {
+    waitpid(children_pids[k], &statuses[k], 0);
   }
 }
