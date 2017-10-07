@@ -281,12 +281,18 @@ static void fork_children(int num_children) {
     }
 
     if (children_pids[i] == 0) { // Child
+      char clock_segment_id_string[12];
+      sprintf(clock_segment_id_string, "%d", clock_segment_id);
+      char message_segment_id_string[12];
+      sprintf(message_segment_id_string, "%d", message_segment_id);
       execlp(
         "user",
         "user",
+        clock_segment_id_string,
+        message_segment_id_string,
         (char*) NULL
       );
-      perror("palin");
+      perror("user");
       _exit(EXIT_FAILURE);
     }
   }
