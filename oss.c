@@ -10,13 +10,22 @@
 #include <sys/shm.h>
 #include <sys/stat.h>
 #include <ctype.h>
+#include <sys/sem.h>
+
+union semun {
+  int val;    /* Value for SETVAL */
+  struct semid_ds *buf;    /* Buffer for IPC_STAT, IPC_SET */
+  unsigned short *array;  /* Array for GETALL, SETALL */
+  struct seminfo *__buf;  /* Buffer for IPC_INFO (Linux-specific) */
+};
+
 
 static int setup_interval_timer(int time);
 static int setup_interrupt(void);
 static void free_shared_memory(void);
 static void free_shared_memory_and_abort(int s);
 static void print_help_message(char* executable_name,
-                               int max_slaves,
+                               int max_inital_slaves,
                                char* log_file,
                                int max_run_time,
                                int max_sim_time);
@@ -24,6 +33,9 @@ static int is_required_argument(char optopt);
 static void print_required_argument_message(char optopt);
 static int get_clock_shared_segment_size(void);
 static void attach_to_shared_memory(void);
+static int initialize_binary_semaphore(int sem_id);
+static int allocate_binary_semaphore(key_t key, int sem_flags);
+static int deallocate_binary_semaphore(int sem_id);
 static void fork_children(int num_children);
 static void get_shared_memory(void);
 
@@ -31,10 +43,15 @@ static int clock_segment_id;
 static int* clock_shared_memory;
 static int message_segment_id;
 static int* message_shared_memory;
+static int sem_id;
+
+int num_slaves = 0;
+const int MAX_SLAVES = 100;
+const int NANO_SECONDS_PER_SECOND = 1000000000;
 
 int main(int argc, char* argv[]) {
   int help_flag = 0;
-  int max_slaves = 5;
+  int max_inital_slaves = 5;
   char* log_file = "oss.out";
   int max_run_time = 20;
   int max_sim_time = 2;
@@ -47,7 +64,7 @@ int main(int argc, char* argv[]) {
         help_flag = 1;
         break;
       case 's':
-        max_slaves = atoi(optarg);
+        max_inital_slaves = atoi(optarg);
         break;
       case 'l':
         log_file = optarg;
@@ -73,11 +90,11 @@ int main(int argc, char* argv[]) {
   }
 
   if (help_flag) {
-    print_help_message(argv[0], max_slaves, log_file, max_run_time, max_sim_time);
+    print_help_message(argv[0], max_inital_slaves, log_file, max_run_time, max_sim_time);
     exit(EXIT_SUCCESS);
   }
 
-  if (max_slaves < 1) {
+  if (max_inital_slaves < 1) {
     fprintf(stderr, "Invalid argument for option -s\n");
     exit(EXIT_SUCCESS);
   }
@@ -106,11 +123,37 @@ int main(int argc, char* argv[]) {
 
   get_shared_memory();
 
+  sem_id = allocate_binary_semaphore(IPC_PRIVATE, IPC_CREAT | IPC_EXCL | S_IRUSR | S_IWUSR);
+
   attach_to_shared_memory();
 
-  fork_children(max_slaves);
+  int init_sem_success = initialize_binary_semaphore(sem_id);
+  if (init_sem_success == -1) {
+    perror("Faled to initilaize binary semaphore");
+    return EXIT_FAILURE;
+  }
+
+  fork_children(max_inital_slaves);
+
+  while (1) {
+    if (*(clock_shared_memory + 1) == NANO_SECONDS_PER_SECOND) {
+      *clock_shared_memory += 1;
+      *(clock_shared_memory + 1) = 0;
+    } else {
+      *(clock_shared_memory + 1) += 2; // Add 4 for more realistic clock
+    }
+    if (*clock_shared_memory == 2 || num_slaves == MAX_SLAVES) {
+      break;
+    }
+  }
 
   free_shared_memory();
+
+  int deallocate_sem_success = deallocate_binary_semaphore(sem_id);
+  if (deallocate_sem_success == -1) {
+    perror("Failed to deallocate binary semaphore");
+    return EXIT_FAILURE;
+  }
 
   return EXIT_SUCCESS;
 }
@@ -170,13 +213,13 @@ static int setup_interval_timer(int time) {
  * The parameters correspond to program arguments.
  *
  * @param executable_name Name of the executable
- * @param max_slaves Number of maximum slaves
+ * @param max_inital_slaves Number of maximum slaves
  * @param log_file Name of the log file
  * @param max_run_time Maximum time program runs
  * @param max_sim_time Maximum simulated time program runs
  */
 static void print_help_message(char* executable_name,
-                               int max_slaves,
+                               int max_inital_slaves,
                                char* log_file,
                                int max_run_time,
                                int max_sim_time) {
@@ -184,7 +227,7 @@ static void print_help_message(char* executable_name,
   printf("Usage: ./%s\n\n", executable_name);
   printf("Arguments:\n");
   printf(" -h  Show help.\n");
-  printf(" -s  The maximum number of slave processes spawned. Defaults to %d.\n", max_slaves);
+  printf(" -s  The maximum number of slave processes spawned. Defaults to %d.\n", max_inital_slaves);
   printf(" -l  Specify the log file. Defaults to '%s'.\n", log_file);
   printf(" -t  Time in seconds master will terminate itself and all children. Defaults to %d.\n", max_run_time);
   printf(" -m  Simulated time in seconds master will terminate itself and all children. Defaults to %d.\n", max_sim_time);
@@ -243,7 +286,7 @@ static void get_shared_memory(void) {
     IPC_CREAT | IPC_EXCL | S_IRUSR | S_IWUSR);
 
   if (clock_segment_id == -1 || message_segment_id == -1) {
-    perror("oss shmget");
+    perror("Failed to get shared memory");
     exit(EXIT_FAILURE);
   }
 }
@@ -258,7 +301,7 @@ static void attach_to_shared_memory(void) {
   message_shared_memory = (int*) shmat(message_segment_id, 0, 0);
 
   if (*clock_shared_memory == -1 || *message_shared_memory == -1) {
-    perror("master shmat");
+    perror("Failed to attach to shared memory");
     exit(EXIT_FAILURE);
   }
 }
@@ -271,12 +314,12 @@ static void attach_to_shared_memory(void) {
 static void fork_children(int num_children) {
   int i;
   pid_t children_pids[num_children];
-  int statuses[num_children];
   for (i = 0; i < num_children; i++) {
     children_pids[i] = fork();
+    num_slaves++;
 
     if (children_pids[i] == -1) {
-      perror("oss fork");
+      perror("Failed to fork");
       exit(EXIT_FAILURE);
     }
 
@@ -285,19 +328,35 @@ static void fork_children(int num_children) {
       sprintf(clock_segment_id_string, "%d", clock_segment_id);
       char message_segment_id_string[12];
       sprintf(message_segment_id_string, "%d", message_segment_id);
+      char sem_id_string[12];
+      sprintf(sem_id_string, "%d", sem_id);
       execlp(
         "user",
         "user",
         clock_segment_id_string,
         message_segment_id_string,
+        sem_id_string,
         (char*) NULL
       );
-      perror("user");
+      perror("Failed to exec");
       _exit(EXIT_FAILURE);
     }
   }
-  int k;
-  for (k = 0; k < num_children; k++) {
-    waitpid(children_pids[k], &statuses[k], 0);
-  }
 }
+
+static int allocate_binary_semaphore(key_t key, int sem_flags) {
+  return semget (key, 1, sem_flags);
+} 
+
+static int deallocate_binary_semaphore(int sem_id) {
+  union semun ignored_argument;
+  return semctl(sem_id, 1, IPC_RMID, ignored_argument);
+}
+
+static int initialize_binary_semaphore(int sem_id) {
+ union semun argument;
+ unsigned short values[1];
+ values[0] = 1;
+ argument.array = values;
+ return semctl(sem_id, 0, SETALL, argument);
+} 
