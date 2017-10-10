@@ -3,6 +3,13 @@ This program creates an operating system simulator that forks child processes, m
 
 Child processes randomly terminate within 1 to 1,000,000 nano seconds of being created.
 
+## How to Build and Run
+1. Clone or download the project
+
+Within the root of the project:
+2. Run `make`
+3. Run `oss`
+
 ## Arguments
 ```
  -h  Show help.
