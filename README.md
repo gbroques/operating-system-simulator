@@ -3,7 +3,7 @@ This program creates an operating system simulator that forks child processes, m
 
 Child processes randomly terminate within 1 to 1,000,000 nano seconds of being created.
 
-## Arugments
+## Arguments
 ```
  -h  Show help.
  -s  The maximum number of slave processes spawned. Defaults to 5.
