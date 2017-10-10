@@ -19,7 +19,6 @@ union semun {
   struct seminfo *__buf;  /* Buffer for IPC_INFO (Linux-specific) */
 };
 
-
 static int setup_interval_timer(int time);
 static int setup_interrupt(void);
 static void free_shared_memory(void);
@@ -36,8 +35,10 @@ static void attach_to_shared_memory(void);
 static int initialize_binary_semaphore(int sem_id);
 static int allocate_binary_semaphore(key_t key, int sem_flags);
 static int deallocate_binary_semaphore(int sem_id);
-static void fork_children(int num_children);
+static void fork_and_exec_children(int num_children);
+static void fork_and_exec_child(void);
 static void get_shared_memory(void);
+static void empty_message(void);
 
 static int clock_segment_id;
 static int* clock_shared_memory;
@@ -45,9 +46,29 @@ static int message_segment_id;
 static int* message_shared_memory;
 static int sem_id;
 
-int num_slaves = 0;
+int num_slaves_completed = 0;
 const int MAX_SLAVES = 100;
+FILE* fp;
 const int NANO_SECONDS_PER_SECOND = 1000000000;
+
+void handle_child_termination(int signum) {
+  int status;
+  pid_t pid = wait(&status);
+
+  fprintf(
+    fp,
+    "[Master] Child %d is terminating at my time %d:%d because it reached %d:%d in slave\n",
+    pid,
+    *clock_shared_memory,
+    *(clock_shared_memory + 1),
+    *(message_shared_memory),
+    *(message_shared_memory + 1)
+  );
+
+  empty_message();
+  fork_and_exec_child();
+  num_slaves_completed++;
+}
 
 int main(int argc, char* argv[]) {
   int help_flag = 0;
@@ -119,7 +140,15 @@ int main(int argc, char* argv[]) {
     return EXIT_FAILURE;
   }
 
+  fp = fopen(log_file, "w+");
+
+  if (fp == NULL) {
+    perror("Failed to open log file");
+    exit(EXIT_FAILURE);
+  }
+
   signal(SIGINT, free_shared_memory_and_abort);
+  signal(SIGCHLD, handle_child_termination);
 
   get_shared_memory();
 
@@ -127,13 +156,15 @@ int main(int argc, char* argv[]) {
 
   attach_to_shared_memory();
 
+  empty_message(); // Initialize message to 0
+
   int init_sem_success = initialize_binary_semaphore(sem_id);
   if (init_sem_success == -1) {
     perror("Faled to initilaize binary semaphore");
     return EXIT_FAILURE;
   }
 
-  fork_children(max_inital_slaves);
+  fork_and_exec_children(max_inital_slaves);
 
   while (1) {
     if (*(clock_shared_memory + 1) == NANO_SECONDS_PER_SECOND) {
@@ -142,18 +173,12 @@ int main(int argc, char* argv[]) {
     } else {
       *(clock_shared_memory + 1) += 2; // Add 4 for more realistic clock
     }
-    if (*clock_shared_memory == 2 || num_slaves == MAX_SLAVES) {
+    if (*clock_shared_memory == max_sim_time || num_slaves_completed == MAX_SLAVES) {
       break;
     }
   }
 
   free_shared_memory();
-
-  int deallocate_sem_success = deallocate_binary_semaphore(sem_id);
-  if (deallocate_sem_success == -1) {
-    perror("Failed to deallocate binary semaphore");
-    return EXIT_FAILURE;
-  }
 
   return EXIT_SUCCESS;
 }
@@ -166,11 +191,16 @@ static int get_clock_shared_segment_size() {
  * Frees all allocated shared memory
  */
 static void free_shared_memory(void) {
-  printf("Freeing shared memory\n");
   shmdt(clock_shared_memory);
   shmdt(message_shared_memory);
   shmctl(clock_segment_id, IPC_RMID, 0);
   shmctl(message_segment_id, IPC_RMID, 0);
+
+  int deallocate_sem_success = deallocate_binary_semaphore(sem_id);
+  if (deallocate_sem_success == -1) {
+    perror("Failed to deallocate binary semaphore");
+    exit(EXIT_FAILURE);
+  }
 }
 
 
@@ -197,7 +227,6 @@ static int setup_interrupt(void) {
  * Sets up an interval timer
  *
  * @param time The duration of the timer
- *
  * @return Zero on success. -1 on error.
  */
 static int setup_interval_timer(int time) {
@@ -311,36 +340,10 @@ static void attach_to_shared_memory(void) {
  *
  * @param num_children The number of children to fork.
  */
-static void fork_children(int num_children) {
+static void fork_and_exec_children(int num_children) {
   int i;
-  pid_t children_pids[num_children];
   for (i = 0; i < num_children; i++) {
-    children_pids[i] = fork();
-    num_slaves++;
-
-    if (children_pids[i] == -1) {
-      perror("Failed to fork");
-      exit(EXIT_FAILURE);
-    }
-
-    if (children_pids[i] == 0) { // Child
-      char clock_segment_id_string[12];
-      sprintf(clock_segment_id_string, "%d", clock_segment_id);
-      char message_segment_id_string[12];
-      sprintf(message_segment_id_string, "%d", message_segment_id);
-      char sem_id_string[12];
-      sprintf(sem_id_string, "%d", sem_id);
-      execlp(
-        "user",
-        "user",
-        clock_segment_id_string,
-        message_segment_id_string,
-        sem_id_string,
-        (char*) NULL
-      );
-      perror("Failed to exec");
-      _exit(EXIT_FAILURE);
-    }
+    fork_and_exec_child();
   }
 }
 
@@ -359,4 +362,37 @@ static int initialize_binary_semaphore(int sem_id) {
  values[0] = 1;
  argument.array = values;
  return semctl(sem_id, 0, SETALL, argument);
-} 
+}
+
+static void empty_message(void) {
+  *message_shared_memory = 0;
+  *(message_shared_memory + 1) = 0;
+}
+
+static void fork_and_exec_child(void) {
+    pid_t pid = fork();
+
+    if (pid == -1) {
+      perror("Failed to fork");
+      exit(EXIT_FAILURE);
+    }
+
+    if (pid == 0) { // Child
+      char clock_segment_id_string[12];
+      sprintf(clock_segment_id_string, "%d", clock_segment_id);
+      char message_segment_id_string[12];
+      sprintf(message_segment_id_string, "%d", message_segment_id);
+      char sem_id_string[12];
+      sprintf(sem_id_string, "%d", sem_id);
+      execlp(
+        "user",
+        "user",
+        clock_segment_id_string,
+        message_segment_id_string,
+        sem_id_string,
+        (char*) NULL
+      );
+      perror("Failed to exec");
+      _exit(EXIT_FAILURE);
+    }
+}
