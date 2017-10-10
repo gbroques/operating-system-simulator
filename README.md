@@ -7,6 +7,7 @@ Child processes randomly terminate within 1 to 1,000,000 nano seconds of being c
 1. Clone or download the project
 
 Within the root of the project:
+
 2. Run `make`
 3. Run `oss`
 
